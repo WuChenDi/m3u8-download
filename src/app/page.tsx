@@ -783,7 +783,7 @@ export default function M3u8Downloader() {
                 )}
               </div>
 
-              <div className="flex flex-col gap-2">
+              <div className="grid grid-cols-2 gap-2">
                 {!downloadState.isDownloading ? (
                   <>
                     {!rangeDownload.isShowRange ? (
@@ -847,19 +847,19 @@ export default function M3u8Downloader() {
                 isSupperStreamWrite && (
                   <div className="pt-4 border-t space-y-3">
                     <p className="text-sm text-muted-foreground">
-                      超大视频建议使用流式下载（几乎不占内存）
+                      超大视频建议使用流式下载（占内存占用小）
                     </p>
-                    <div className="flex flex-col gap-2">
+                    <div className="grid grid-cols-2 gap-2">
                       <Button
                         onClick={() => streamDownload(false)}
                         variant="outline"
-                        className="w-full h-11"
+                        className="w-full"
                       >
                         流式原格式下载 (.ts)
                       </Button>
                       <Button
                         onClick={() => streamDownload(true)}
-                        className="w-full h-11"
+                        className="w-full"
                       >
                         流式 MP4 下载
                       </Button>
@@ -938,7 +938,7 @@ export default function M3u8Downloader() {
                   </Alert>
                 )}
 
-                <div className="flex-1 overflow-y-auto">
+                <div className="flex-1">
                   <TooltipProvider>
                     <div
                       className={cn(
