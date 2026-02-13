@@ -2,7 +2,7 @@
 
 import { format } from 'date-fns'
 import { Download, Pause, Play } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { PageContainer } from '@/components/layout'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -26,7 +26,11 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { cn } from '@/lib'
+import { AESDecryptor, cn, logger } from '@/lib'
+
+// ============================================================
+// Types
+// ============================================================
 
 interface FinishItem {
   title: string
@@ -44,7 +48,7 @@ interface AesConf {
   uri: string
   iv: string | Uint8Array
   key: ArrayBuffer | null
-  decryptor: any
+  decryptor: AESDecryptor | null
   stringToBuffer: (str: string) => Uint8Array
 }
 
@@ -55,6 +59,60 @@ interface DownloadState {
   downloadIndex: number
   streamDownloadIndex: number
 }
+
+// ============================================================
+// Helpers
+// ============================================================
+
+const fetchData = async (url: string, type?: 'file' | 'text'): Promise<any> => {
+  const response = await fetch(url)
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+  return type === 'file' ? response.arrayBuffer() : response.text()
+}
+
+const applyURL = (targetURL: string, baseURL?: string) => {
+  baseURL =
+    baseURL || (typeof window !== 'undefined' ? window.location.href : '')
+  if (targetURL.indexOf('http') === 0) {
+    if (window.location.href.indexOf('https') === 0) {
+      return targetURL.replace('http://', 'https://')
+    }
+    return targetURL
+  }
+  if (targetURL[0] === '/') {
+    const domain = baseURL.split('/')
+    return `${domain[0]}//${domain[2]}${targetURL}`
+  }
+  const domain = baseURL.split('/')
+  domain.pop()
+  return `${domain.join('/')}/${targetURL}`
+}
+
+const triggerBrowserDownload = (
+  fileDataList: ArrayBuffer[],
+  fileName: string,
+  isMp4: boolean,
+) => {
+  const fileBlob = isMp4
+    ? new Blob(fileDataList, { type: 'video/mp4' })
+    : new Blob(fileDataList, { type: 'video/MP2T' })
+
+  const extension = isMp4 ? '.mp4' : '.ts'
+  const a = document.createElement('a')
+  a.download = fileName + extension
+  a.href = URL.createObjectURL(fileBlob)
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(a.href), 100)
+}
+
+// ============================================================
+// Component
+// ============================================================
 
 export default function M3u8Downloader() {
   const [url, setUrl] = useState('')
@@ -70,8 +128,7 @@ export default function M3u8Downloader() {
 
   const [finishList, setFinishList] = useState<FinishItem[]>([])
   const [tsUrlList, setTsUrlList] = useState<string[]>([])
-  const [mediaFileList, setMediaFileList] = useState<ArrayBuffer[]>([])
-  const [streamWriter, setStreamWriter] = useState<any>(null)
+  const streamWriter = useRef<any>(null)
 
   const [rangeDownload, setRangeDownload] = useState<RangeDownload>({
     isShowRange: false,
@@ -88,11 +145,18 @@ export default function M3u8Downloader() {
     stringToBuffer: (str: string) => new TextEncoder().encode(str),
   })
 
-  // 使用 ref 存储开始时间和持续时间，避免不必要的重渲染
+  // ---- Refs ----
   const beginTimeRef = useRef(new Date())
   const durationSecondRef = useRef(0)
+  const mediaFileListRef = useRef<ArrayBuffer[]>([])
 
-  // 派生状态 - 从 finishList 计算得出
+  const downloadStateRef = useRef(downloadState)
+  downloadStateRef.current = downloadState
+
+  // aesConf ref：解密在 async worker 中调用，需要读取最新值
+  const aesConfRef = useRef(aesConf)
+  aesConfRef.current = aesConf
+
   const { finishNum, errorNum } = useMemo(() => {
     const finished = finishList.filter(
       (item) => item.status === 'finish',
@@ -101,7 +165,6 @@ export default function M3u8Downloader() {
     return { finishNum: finished, errorNum: errors }
   }, [finishList])
 
-  // 派生状态 - 目标片段数
   const targetSegment = useMemo(() => {
     const start = Math.max(parseInt(rangeDownload.startSegment) || 1, 1)
     const end = Math.max(
@@ -115,7 +178,6 @@ export default function M3u8Downloader() {
     return finalEnd - finalStart + 1
   }, [rangeDownload.startSegment, rangeDownload.endSegment, tsUrlList.length])
 
-  // 检测是否支持流式下载
   const isSupperStreamWrite = useMemo(
     () =>
       typeof window !== 'undefined' &&
@@ -124,17 +186,497 @@ export default function M3u8Downloader() {
     [],
   )
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
+  // ---- AES 解密 ----
+  const aesDecrypt = (data: ArrayBuffer, index: number): ArrayBuffer => {
+    const conf = aesConfRef.current
+    const iv =
+      conf.iv ||
+      new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, index])
+    const ivBuffer = iv instanceof Uint8Array ? iv.buffer : iv
+    return conf.decryptor!.decrypt(data, 0, ivBuffer as ArrayBuffer, true)
+  }
+
+  // ---- MP4 转码 ----
+  const conversionMp4 = async (
+    data: ArrayBuffer,
+    index: number,
+    startSegment: number,
+    isGetMP4: boolean,
+  ): Promise<ArrayBuffer> => {
+    if (!isGetMP4) return data
+
+    try {
+      // @ts-expect-error dynamic import
+      const muxjs = await import('mux.js')
+      return await new Promise<ArrayBuffer>((resolve) => {
+        const transmuxer = new muxjs.default.mp4.Transmuxer({
+          keepOriginalTimestamps: true,
+          duration: parseInt(String(durationSecondRef.current)),
+        })
+
+        transmuxer.on('data', (segment: any) => {
+          if (index === startSegment - 1) {
+            const combined = new Uint8Array(
+              segment.initSegment.byteLength + segment.data.byteLength,
+            )
+            combined.set(segment.initSegment, 0)
+            combined.set(segment.data, segment.initSegment.byteLength)
+            resolve(combined.buffer)
+          } else {
+            resolve(segment.data.buffer)
+          }
+        })
+
+        transmuxer.push(new Uint8Array(data))
+        transmuxer.flush()
+      })
+    } catch (error) {
+      logger.error('MP4 转码失败:', error)
+      toast.error('MP4 转码失败，将使用原始 TS 格式')
+      return data
+    }
+  }
+
+  // ---- 处理单个 TS 片段 ----
+  const dealTS = async (
+    file: ArrayBuffer,
+    index: number,
+    startSegment: number,
+    isGetMP4: boolean,
+  ) => {
+    const data = aesConfRef.current.uri ? aesDecrypt(file, index) : file
+    const afterData = await conversionMp4(data, index, startSegment, isGetMP4)
+
+    const mediaListIndex = index - startSegment + 1
+    mediaFileListRef.current[mediaListIndex] = afterData
+
+    setFinishList((prev) => {
+      const newList = [...prev]
+      newList[index] = { ...newList[index], status: 'finish' }
+      const newFinishNum = newList.filter(
+        (item) => item.status === 'finish',
+      ).length
+
+      // 流式写入
+      if (streamWriter.current) {
+        let currentStreamIndex = downloadStateRef.current.streamDownloadIndex
+
+        for (
+          let idx = currentStreamIndex;
+          idx < mediaFileListRef.current.length;
+          idx++
+        ) {
+          if (mediaFileListRef.current[idx]) {
+            streamWriter.current.write(
+              new Uint8Array(mediaFileListRef.current[idx]),
+            )
+            mediaFileListRef.current[idx] = null as any
+            currentStreamIndex = idx + 1
+          } else {
+            break
+          }
+        }
+
+        setDownloadState((p) => ({
+          ...p,
+          streamDownloadIndex: currentStreamIndex,
+        }))
+
+        if (currentStreamIndex >= targetSegment) {
+          streamWriter.current.close()
+          toast.success(`流式下载完成，共 ${newFinishNum} 个片段`)
+        }
+      } else if (newFinishNum === targetSegment) {
+        const completeMediaList = mediaFileListRef.current.filter(Boolean)
+        triggerBrowserDownload(
+          completeMediaList,
+          title || format(beginTimeRef.current, 'yyyy_MM_dd_HH_mm_ss'),
+          downloadStateRef.current.isGetMP4,
+        )
+        toast.success(`下载完成，共 ${newFinishNum} 个片段`)
+      }
+
+      return newList
+    })
+  }
+
+  // ---- 并发下载 TS 片段（async worker pool） ----
+  const downloadTS = async (
+    urlList: string[],
+    finishItems: FinishItem[],
+    startSegment: number,
+    endSegment: number,
+    isGetMP4: boolean,
+  ) => {
+    let currentIndex = downloadStateRef.current.downloadIndex
+
+    const next = (): number | null => {
+      if (currentIndex >= endSegment) return null
+      const idx = currentIndex++
+      setDownloadState((prev) => ({ ...prev, downloadIndex: currentIndex }))
+      return idx
+    }
+
+    const worker = async () => {
+      while (true) {
+        if (downloadStateRef.current.isPaused) return
+
+        const index = next()
+        if (index === null) return
+
+        if (finishItems[index]?.status !== '') continue
+
+        setFinishList((prev) => {
+          const newList = [...prev]
+          newList[index] = { ...newList[index], status: 'downloading' }
+          return newList
+        })
+
+        try {
+          const file = await fetchData(urlList[index], 'file')
+          await dealTS(file, index, startSegment, isGetMP4)
+        } catch {
+          setFinishList((prev) => {
+            const newList = [...prev]
+            newList[index] = { ...newList[index], status: 'error' }
+
+            const newErrorNum = newList.filter(
+              (i) => i.status === 'error',
+            ).length
+            if (newErrorNum % 5 === 0 && newErrorNum > 0) {
+              toast.warning(`已有 ${newErrorNum} 个片段下载失败，正在自动重试`)
+            }
+            return newList
+          })
+        }
+      }
+    }
+
+    const concurrency = Math.min(6, targetSegment - finishNum)
+    await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  }
+
+  // ---- 获取 AES key 并初始化解密器 ----
+  const getAES = async (
+    currentAesConf: AesConf,
+    urlList: string[],
+    finishItems: FinishItem[],
+    startSegment: number,
+    endSegment: number,
+    isGetMP4: boolean,
+  ) => {
+    try {
+      const key = await fetchData(currentAesConf.uri, 'file')
+      const decryptor = new AESDecryptor()
+      decryptor.expandKey(key)
+
+      const newAesConf: AesConf = {
+        ...currentAesConf,
+        key,
+        decryptor,
+      }
+      setAesConf(newAesConf)
+      aesConfRef.current = newAesConf
+
+      await downloadTS(urlList, finishItems, startSegment, endSegment, isGetMP4)
+    } catch {
+      toast.error('视频已加密，无法下载')
+      setDownloadState((prev) => ({ ...prev, isDownloading: false }))
+    }
+  }
+
+  // ---- 主入口：解析 m3u8 并开始下载 ----
+  const getM3U8 = async (onlyGetRange: boolean) => {
+    if (!url) {
+      toast.error('请输入链接')
+      return
+    }
+    if (url.toLowerCase().indexOf('m3u8') === -1) {
+      toast.error('链接有误，请重新输入')
+      return
+    }
+    if (downloadState.isDownloading) {
+      toast.warning('资源下载中，请稍后')
+      return
+    }
+
+    const urlObj = new URL(url)
+    const newTitle = urlObj.searchParams.get('title') || title
+    setTitle(newTitle)
+    beginTimeRef.current = new Date()
+
+    toast.info('正在解析 m3u8 文件')
+
+    try {
+      const m3u8Str: string = await fetchData(url)
+
+      const newTsUrlList: string[] = []
+      const newFinishList: FinishItem[] = []
+
+      m3u8Str.split('\n').forEach((item) => {
+        if (/^[^#]/.test(item) && item.trim()) {
+          newTsUrlList.push(applyURL(item, url))
+          newFinishList.push({ title: item, status: '' })
+        }
+      })
+
+      setTsUrlList(newTsUrlList)
+      setFinishList(newFinishList)
+
+      if (onlyGetRange) {
+        setRangeDownload({
+          isShowRange: true,
+          endSegment: String(newTsUrlList.length),
+          startSegment: '1',
+        })
+        return
+      }
+
+      // 计算有效范围
+      let startSeg = Math.max(parseInt(rangeDownload.startSegment) || 1, 1)
+      let endSeg = Math.max(
+        parseInt(rangeDownload.endSegment) || newTsUrlList.length,
+        1,
+      )
+      startSeg = Math.min(startSeg, newTsUrlList.length)
+      endSeg = Math.min(endSeg, newTsUrlList.length)
+      const newStartSegment = Math.min(startSeg, endSeg)
+      const newEndSegment = Math.max(startSeg, endSeg)
+
+      setRangeDownload((prev) => ({
+        ...prev,
+        startSegment: String(newStartSegment),
+        endSegment: String(newEndSegment),
+      }))
+      setDownloadState((prev) => ({
+        ...prev,
+        downloadIndex: newStartSegment - 1,
+        isDownloading: true,
+      }))
+
+      mediaFileListRef.current = new Array(newEndSegment - newStartSegment + 1)
+
+      const isGetMP4 = downloadStateRef.current.isGetMP4
+
+      // 获取 MP4 视频总时长
+      if (isGetMP4) {
+        let infoIndex = 0
+        let duration = 0
+        m3u8Str.split('\n').forEach((item) => {
+          if (item.toUpperCase().indexOf('#EXTINF:') > -1) {
+            infoIndex++
+            if (newStartSegment <= infoIndex && infoIndex <= newEndSegment) {
+              duration += parseFloat(item.split('#EXTINF:')[1])
+            }
+          }
+        })
+        durationSecondRef.current = duration
+      }
+
+      // 检测 AES 加密
+      if (m3u8Str.indexOf('#EXT-X-KEY') > -1) {
+        const method = (m3u8Str.match(/(.*METHOD=([^,\s]+))/) || [
+          '',
+          '',
+          '',
+        ])[2]
+        const uri = (m3u8Str.match(/(.*URI="([^"]+))"/) || ['', '', ''])[2]
+        const iv = (m3u8Str.match(/(.*IV=([^,\s]+))/) || ['', '', ''])[2]
+        const newAesConf: AesConf = {
+          ...aesConf,
+          method,
+          uri: applyURL(uri, url),
+          iv: iv ? aesConf.stringToBuffer(iv) : '',
+          decryptor: null,
+        }
+        setAesConf(newAesConf)
+        aesConfRef.current = newAesConf
+
+        await getAES(
+          newAesConf,
+          newTsUrlList,
+          newFinishList,
+          newStartSegment,
+          newEndSegment,
+          isGetMP4,
+        )
+      } else if (newTsUrlList.length > 0) {
+        await downloadTS(
+          newTsUrlList,
+          newFinishList,
+          newStartSegment,
+          newEndSegment,
+          isGetMP4,
+        )
+      } else {
+        toast.error('资源为空，请查看链接是否有效')
+        setDownloadState((prev) => ({ ...prev, isDownloading: false }))
+      }
+    } catch {
+      toast.error('链接不正确，请查看链接是否有效')
+      setDownloadState((prev) => ({ ...prev, isDownloading: false }))
+    }
+  }
+
+  // ---- 流式下载 ----
+  const streamDownload = (isMp4: boolean) => {
+    setDownloadState((prev) => ({ ...prev, isGetMP4: isMp4 }))
+    downloadStateRef.current = {
+      ...downloadStateRef.current,
+      isGetMP4: isMp4,
+    }
+
+    const urlObj = new URL(url)
+    const newTitle = urlObj.searchParams.get('title') || title
+    setTitle(newTitle)
+
+    const fileName = newTitle || format(new Date(), 'yyyy_MM_dd HH_mm_ss')
+    const finalFileName =
+      document.title !== 'm3u8 downloader' ? document.title : fileName
+
+    const writer = (window as any).streamSaver
+      .createWriteStream(`${finalFileName}.${isMp4 ? 'mp4' : 'ts'}`)
+      .getWriter()
+    streamWriter.current = writer
+    toast.info('开始流式下载（边下边存）')
+    void getM3U8(false)
+  }
+
+  // ---- 转码 MP4 下载 ----
+  const getMP4 = () => {
+    setDownloadState((prev) => ({ ...prev, isGetMP4: true }))
+    downloadStateRef.current = {
+      ...downloadStateRef.current,
+      isGetMP4: true,
+    }
+    void getM3U8(false)
+  }
+
+  // ---- 暂停与恢复 ----
+  const togglePause = () => {
+    const newIsPaused = !downloadState.isPaused
+    setDownloadState((prev) => ({ ...prev, isPaused: newIsPaused }))
+    downloadStateRef.current = {
+      ...downloadStateRef.current,
+      isPaused: newIsPaused,
+    }
+    if (!newIsPaused) {
+      retryAll(true)
+    }
+  }
+
+  // ---- 重新下载某个片段 ----
+  const retry = async (index: number) => {
+    if (finishList[index].status !== 'error') return
+
+    const startSegment = parseInt(rangeDownload.startSegment)
+    const isGetMP4 = downloadStateRef.current.isGetMP4
+
+    setFinishList((prev) => {
+      const newList = [...prev]
+      newList[index] = { ...newList[index], status: '' }
+      return newList
+    })
+
+    try {
+      const file = await fetchData(tsUrlList[index], 'file')
+      await dealTS(file, index, startSegment, isGetMP4)
+    } catch {
+      setFinishList((prev) => {
+        const newList = [...prev]
+        newList[index] = { ...newList[index], status: 'error' }
+        return newList
+      })
+    }
+  }
+
+  // ---- 重新下载所有错误片段 ----
+  const retryAll = (forceRestart: boolean) => {
+    if (
+      !finishList.length ||
+      (!forceRestart && downloadStateRef.current.isPaused)
+    ) {
+      return
+    }
+
+    const startSegment = parseInt(rangeDownload.startSegment)
+    const endSegment = parseInt(rangeDownload.endSegment)
+    const isGetMP4 = downloadStateRef.current.isGetMP4
+    let firstErrorIndex = downloadState.downloadIndex
+
+    const newFinishList = finishList.map((item, index) => {
+      if (item.status === 'error') {
+        firstErrorIndex = Math.min(firstErrorIndex, index)
+        return { ...item, status: '' as const }
+      }
+      return item
+    })
+
+    setFinishList(newFinishList)
+
+    if (downloadState.downloadIndex >= endSegment || forceRestart) {
+      setDownloadState((prev) => ({
+        ...prev,
+        downloadIndex: firstErrorIndex,
+      }))
+      downloadStateRef.current = {
+        ...downloadStateRef.current,
+        downloadIndex: firstErrorIndex,
+      }
+      void downloadTS(
+        tsUrlList,
+        newFinishList,
+        startSegment,
+        endSegment,
+        isGetMP4,
+      )
+    } else {
+      setDownloadState((prev) => ({
+        ...prev,
+        downloadIndex: firstErrorIndex,
+      }))
+    }
+  }
+
+  // ---- 强制下载现有片段 ----
+  const forceDownload = () => {
+    const currentMediaList = mediaFileListRef.current.filter(Boolean)
+    if (currentMediaList.length) {
+      triggerBrowserDownload(
+        currentMediaList,
+        title || format(beginTimeRef.current, 'yyyy_MM_dd_HH_mm_ss'),
+        downloadState.isGetMP4,
+      )
+      toast.success('已触发浏览器下载现有片段')
+    } else {
+      toast.warning('当前无已下载片段')
+    }
+  }
+
+  const onEnterKey = useEffectEvent(() => {
+    void getM3U8(false)
+  })
+
+  const onRetryTick = useEffectEvent(() => {
+    retryAll(false)
+  })
+
   useEffect(() => {
-    getSource()
+    if (typeof window !== 'undefined') {
+      const href = window.location.href
+      if (href.indexOf('?source=') > -1) {
+        setUrl(href.split('?source=')[1])
+      }
+    }
+
     const handleKeyup = (event: KeyboardEvent) => {
       if (event.keyCode === 13) {
-        getM3U8(false)
+        onEnterKey()
       }
     }
     window.addEventListener('keyup', handleKeyup)
 
-    const interval = setInterval(() => retryAll(false), 2000)
+    const interval = setInterval(onRetryTick, 2000)
 
     return () => {
       window.removeEventListener('keyup', handleKeyup)
@@ -142,610 +684,11 @@ export default function M3u8Downloader() {
     }
   }, [])
 
-  // 获取链接中携带的资源链接
-  const getSource = () => {
-    if (typeof window !== 'undefined') {
-      const href = window.location.href
-      if (href.indexOf('?source=') > -1) {
-        setUrl(href.split('?source=')[1])
-      }
+  useEffect(() => {
+    return () => {
+      aesConfRef.current.decryptor?.destroy()
     }
-  }
-
-  // 获取文档标题
-  const getDocumentTitle = () => {
-    let docTitle = document.title
-    try {
-      docTitle = window.top?.document.title || document.title
-    } catch (error) {
-      console.log(error)
-    }
-    return docTitle
-  }
-
-  // ajax 请求
-  const ajax = useCallback(
-    (options: {
-      url: string
-      type?: string
-      success?: (data: any) => void
-      fail?: (status?: number) => void
-    }) => {
-      const xhr = new XMLHttpRequest()
-      if (options.type === 'file') {
-        xhr.responseType = 'arraybuffer'
-      }
-
-      xhr.onreadystatechange = function () {
-        if (xhr.readyState === 4) {
-          const status = xhr.status
-          if (status >= 200 && status < 300) {
-            options.success?.(xhr.response)
-          } else {
-            options.fail?.(status)
-          }
-        }
-      }
-
-      xhr.open('GET', options.url, true)
-      xhr.send(null)
-    },
-    [],
-  )
-
-  // 合成URL
-  const applyURL = useCallback((targetURL: string, baseURL?: string) => {
-    baseURL =
-      baseURL || (typeof window !== 'undefined' ? window.location.href : '')
-    if (targetURL.indexOf('http') === 0) {
-      if (window.location.href.indexOf('https') === 0) {
-        return targetURL.replace('http://', 'https://')
-      }
-      return targetURL
-    }
-    if (targetURL[0] === '/') {
-      const domain = baseURL.split('/')
-      return `${domain[0]}//${domain[2]}${targetURL}`
-    }
-    const domain = baseURL.split('/')
-    domain.pop()
-    return `${domain.join('/')}/${targetURL}`
   }, [])
-
-  // 流式下载
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const streamDownload = useCallback(
-    (isMp4: boolean) => {
-      setDownloadState((prev) => ({ ...prev, isGetMP4: isMp4 }))
-      const urlObj = new URL(url)
-      const newTitle = urlObj.searchParams.get('title') || title
-      setTitle(newTitle)
-
-      const fileName = newTitle || format(new Date(), 'yyyy_MM_dd HH_mm_ss')
-      const finalFileName =
-        document.title !== 'm3u8 downloader' ? getDocumentTitle() : fileName
-
-      const writer = (window as any).streamSaver
-        .createWriteStream(`${finalFileName}.${isMp4 ? 'mp4' : 'ts'}`)
-        .getWriter()
-      setStreamWriter(writer)
-      toast.info('开始流式下载（边下边存）')
-      getM3U8(false)
-    },
-    [url, title],
-  )
-
-  // 解析为 mp4 下载
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const getMP4 = useCallback(() => {
-    setDownloadState((prev) => ({ ...prev, isGetMP4: true }))
-    getM3U8(false)
-  }, [])
-
-  // 获取在线文件
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const getM3U8 = useCallback(
-    (onlyGetRange: boolean) => {
-      if (!url) {
-        toast.error('请输入链接')
-        return
-      }
-      if (url.toLowerCase().indexOf('m3u8') === -1) {
-        toast.error('链接有误，请重新输入')
-        return
-      }
-      if (downloadState.isDownloading) {
-        toast.warning('资源下载中，请稍后')
-        return
-      }
-
-      const urlObj = new URL(url)
-      const newTitle = urlObj.searchParams.get('title') || title
-      setTitle(newTitle)
-      beginTimeRef.current = new Date()
-
-      toast.info('正在解析 m3u8 文件')
-
-      ajax({
-        url: url,
-        success: (m3u8Str: string) => {
-          const newTsUrlList: string[] = []
-          const newFinishList: FinishItem[] = []
-
-          m3u8Str.split('\n').forEach((item) => {
-            if (/^[^#]/.test(item) && item.trim()) {
-              newTsUrlList.push(applyURL(item, url))
-              newFinishList.push({
-                title: item,
-                status: '',
-              })
-            }
-          })
-
-          setTsUrlList(newTsUrlList)
-          setFinishList(newFinishList)
-
-          if (onlyGetRange) {
-            setRangeDownload({
-              isShowRange: true,
-              endSegment: String(newTsUrlList.length),
-              startSegment: '1',
-            })
-            return
-          }
-
-          let startSegment = Math.max(
-            parseInt(rangeDownload.startSegment) || 1,
-            1,
-          )
-          let endSegment = Math.max(
-            parseInt(rangeDownload.endSegment) || newTsUrlList.length,
-            1,
-          )
-          startSegment = Math.min(startSegment, newTsUrlList.length)
-          endSegment = Math.min(endSegment, newTsUrlList.length)
-          const newStartSegment = Math.min(startSegment, endSegment)
-          const newEndSegment = Math.max(startSegment, endSegment)
-
-          setRangeDownload((prev) => ({
-            ...prev,
-            startSegment: String(newStartSegment),
-            endSegment: String(newEndSegment),
-          }))
-          setDownloadState((prev) => ({
-            ...prev,
-            downloadIndex: newStartSegment - 1,
-            isDownloading: true,
-          }))
-
-          // 获取需要下载的 MP4 视频长度
-          if (downloadState.isGetMP4) {
-            let infoIndex = 0
-            let duration = 0
-            m3u8Str.split('\n').forEach((item) => {
-              if (item.toUpperCase().indexOf('#EXTINF:') > -1) {
-                infoIndex++
-                if (
-                  parseInt(rangeDownload.startSegment) <= infoIndex &&
-                  infoIndex <= parseInt(rangeDownload.endSegment)
-                ) {
-                  duration += parseFloat(item.split('#EXTINF:')[1])
-                }
-              }
-            })
-            durationSecondRef.current = duration
-          }
-
-          // 检测视频 AES 加密
-          if (m3u8Str.indexOf('#EXT-X-KEY') > -1) {
-            const method = (m3u8Str.match(/(.*METHOD=([^,\s]+))/) || [
-              '',
-              '',
-              '',
-            ])[2]
-            const uri = (m3u8Str.match(/(.*URI="([^"]+))"/) || ['', '', ''])[2]
-            const iv = (m3u8Str.match(/(.*IV=([^,\s]+))/) || ['', '', ''])[2]
-            const newAesConf = {
-              ...aesConf,
-              method,
-              uri: applyURL(uri, url),
-              iv: iv ? aesConf.stringToBuffer(iv) : '',
-            }
-            setAesConf(newAesConf)
-            getAES(newAesConf)
-          } else if (newTsUrlList.length > 0) {
-            downloadTS(newTsUrlList, newFinishList)
-          } else {
-            toast.error('资源为空，请查看链接是否有效')
-            setDownloadState((prev) => ({ ...prev, isDownloading: false }))
-          }
-        },
-        fail: () => {
-          toast.error('链接不正确，请查看链接是否有效')
-          setDownloadState((prev) => ({ ...prev, isDownloading: false }))
-        },
-      })
-    },
-    [
-      url,
-      title,
-      downloadState.isDownloading,
-      downloadState.isGetMP4,
-      rangeDownload,
-      aesConf,
-      ajax,
-      applyURL,
-    ],
-  )
-
-  // 获取AES配置
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const getAES = useCallback(
-    (currentAesConf: AesConf) => {
-      ajax({
-        type: 'file',
-        url: currentAesConf.uri,
-        success: (key: ArrayBuffer) => {
-          const newAesConf = {
-            ...currentAesConf,
-            key,
-          }
-          setAesConf(newAesConf)
-          downloadTS(tsUrlList, finishList)
-        },
-        fail: () => {
-          toast.error('视频已加密，无法下载')
-          setDownloadState((prev) => ({ ...prev, isDownloading: false }))
-        },
-      })
-    },
-    [ajax, tsUrlList, finishList],
-  )
-
-  // ts 片段的 AES 解码
-  const aesDecrypt = useCallback(
-    (data: ArrayBuffer, index: number) => {
-      const iv =
-        aesConf.iv ||
-        new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, index])
-      // 这里需要实际的解密实现
-      return data
-    },
-    [aesConf.iv],
-  )
-
-  // 下载分片
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const downloadTS = useCallback(
-    (urlList: string[], finishItems: FinishItem[]) => {
-      let currentDownloadIndex = downloadState.downloadIndex
-
-      const download = () => {
-        const pause = downloadState.isPaused
-        const index = currentDownloadIndex
-        const endSegment = parseInt(rangeDownload.endSegment)
-
-        if (index >= endSegment) {
-          return
-        }
-
-        currentDownloadIndex++
-        setDownloadState((prev) => ({
-          ...prev,
-          downloadIndex: currentDownloadIndex,
-        }))
-
-        if (finishItems[index] && finishItems[index].status === '') {
-          setFinishList((prev) => {
-            const newList = [...prev]
-            newList[index].status = 'downloading'
-            return newList
-          })
-
-          ajax({
-            url: urlList[index],
-            type: 'file',
-            success: (file: ArrayBuffer) => {
-              dealTS(file, index, () => {
-                if (currentDownloadIndex < endSegment && !pause) {
-                  download()
-                }
-              })
-            },
-            fail: () => {
-              setFinishList((prev) => {
-                const newList = [...prev]
-                newList[index].status = 'error'
-
-                // 计算错误数并显示提示
-                const newErrorNum = newList.filter(
-                  (item) => item.status === 'error',
-                ).length
-                if (newErrorNum % 5 === 0 && newErrorNum > 0) {
-                  toast.warning(
-                    `已有 ${newErrorNum} 个片段下载失败，正在自动重试`,
-                  )
-                }
-
-                return newList
-              })
-
-              if (currentDownloadIndex < endSegment && !pause) {
-                download()
-              }
-            },
-          })
-        } else if (currentDownloadIndex < endSegment && !pause) {
-          download()
-        }
-      }
-
-      // 建立多个 ajax 线程
-      for (let i = 0; i < Math.min(6, targetSegment - finishNum); i++) {
-        download()
-      }
-    },
-    [
-      downloadState.downloadIndex,
-      downloadState.isPaused,
-      rangeDownload.endSegment,
-      ajax,
-      targetSegment,
-      finishNum,
-    ],
-  )
-
-  // 转码为 mp4
-  const conversionMp4 = useCallback(
-    async (
-      data: ArrayBuffer,
-      index: number,
-      callback: (data: ArrayBuffer) => void,
-    ) => {
-      if (downloadState.isGetMP4) {
-        try {
-          // @ts-expect-error
-          const muxjs = await import('mux.js')
-
-          const transmuxer = new muxjs.default.mp4.Transmuxer({
-            keepOriginalTimestamps: true,
-          })
-
-          transmuxer.on('data', (segment: any) => {
-            // 第一个片段需要包含初始化段
-            if (index === parseInt(rangeDownload.startSegment) - 1) {
-              const initSegmentLength = segment.initSegment.byteLength
-              const dataLength = segment.data.byteLength
-              const combinedData = new Uint8Array(
-                initSegmentLength + dataLength,
-              )
-
-              combinedData.set(segment.initSegment, 0)
-              combinedData.set(segment.data, initSegmentLength)
-
-              callback(combinedData.buffer)
-            } else {
-              // 其他片段只需要数据部分
-              callback(segment.data.buffer)
-            }
-          })
-
-          transmuxer.on('done', () => {
-            // 转码完成
-          })
-
-          // 推送数据进行转码
-          transmuxer.push(new Uint8Array(data))
-          transmuxer.flush()
-        } catch (error) {
-          console.error('MP4 转码失败:', error)
-          toast.error('MP4 转码失败，将使用原始 TS 格式')
-          callback(data)
-        }
-      } else {
-        callback(data)
-      }
-    },
-    [downloadState.isGetMP4, rangeDownload.startSegment],
-  )
-
-  // 处理 ts 片段
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const dealTS = useCallback(
-    async (file: ArrayBuffer, index: number, callback?: () => void) => {
-      const data = aesConf.uri ? aesDecrypt(file, index) : file
-
-      await conversionMp4(data, index, (afterData: ArrayBuffer) => {
-        setMediaFileList((prev) => {
-          const newList = [...prev]
-          newList[index - parseInt(rangeDownload.startSegment) + 1] = afterData
-          return newList
-        })
-
-        setFinishList((prev) => {
-          const newList = [...prev]
-          newList[index].status = 'finish'
-          const newFinishNum = newList.filter(
-            (item) => item.status === 'finish',
-          ).length
-
-          if (streamWriter) {
-            // 流式写入逻辑
-            let currentStreamIndex = downloadState.streamDownloadIndex
-            const currentMediaList = [...mediaFileList]
-            currentMediaList[index - parseInt(rangeDownload.startSegment) + 1] =
-              afterData
-
-            for (
-              let idx = currentStreamIndex;
-              idx < currentMediaList.length;
-              idx++
-            ) {
-              if (currentMediaList[idx]) {
-                streamWriter.write(new Uint8Array(currentMediaList[idx]))
-                currentMediaList[idx] = null as any
-                currentStreamIndex = idx + 1
-              } else {
-                break
-              }
-            }
-
-            setDownloadState((prev) => ({
-              ...prev,
-              streamDownloadIndex: currentStreamIndex,
-            }))
-
-            if (currentStreamIndex >= targetSegment) {
-              streamWriter.close()
-              toast.success(`流式下载完成，共 ${newFinishNum} 个片段`)
-            }
-          } else if (newFinishNum === targetSegment) {
-            const currentMediaList = [...mediaFileList]
-            currentMediaList[index - parseInt(rangeDownload.startSegment) + 1] =
-              afterData
-            downloadFile(
-              currentMediaList,
-              title || format(beginTimeRef.current, 'yyyy_MM_dd_HH_mm_ss'),
-            )
-            toast.success(`下载完成，共 ${newFinishNum} 个片段`)
-          }
-
-          return newList
-        })
-
-        callback?.()
-      })
-    },
-    [
-      aesConf.uri,
-      aesDecrypt,
-      conversionMp4,
-      rangeDownload.startSegment,
-      streamWriter,
-      downloadState.streamDownloadIndex,
-      mediaFileList,
-      targetSegment,
-      title,
-    ],
-  )
-
-  // 暂停与恢复
-  // biome-ignore lint/correctness/useExhaustiveDependencies: <explanation>
-  const togglePause = useCallback(() => {
-    setDownloadState((prev) => ({ ...prev, isPaused: !prev.isPaused }))
-    if (downloadState.isPaused) {
-      retryAll(true)
-    }
-  }, [downloadState.isPaused])
-
-  // 重新下载某个片段
-  const retry = useCallback(
-    (index: number) => {
-      if (finishList[index].status === 'error') {
-        setFinishList((prev) => {
-          const newList = [...prev]
-          newList[index].status = ''
-          return newList
-        })
-
-        ajax({
-          url: tsUrlList[index],
-          type: 'file',
-          success: (file: ArrayBuffer) => {
-            dealTS(file, index)
-          },
-          fail: () => {
-            setFinishList((prev) => {
-              const newList = [...prev]
-              newList[index].status = 'error'
-              return newList
-            })
-          },
-        })
-      }
-    },
-    [finishList, tsUrlList, ajax, dealTS],
-  )
-
-  // 重新下载所有错误片段
-  const retryAll = useCallback(
-    (forceRestart: boolean) => {
-      if (!finishList.length || downloadState.isPaused) {
-        return
-      }
-
-      let firstErrorIndex = downloadState.downloadIndex
-      const newFinishList = finishList.map((item, index) => {
-        if (item.status === 'error') {
-          firstErrorIndex = Math.min(firstErrorIndex, index)
-          return { ...item, status: '' as const }
-        }
-        return item
-      })
-
-      setFinishList(newFinishList)
-
-      if (
-        downloadState.downloadIndex >= parseInt(rangeDownload.endSegment) ||
-        forceRestart
-      ) {
-        setDownloadState((prev) => ({
-          ...prev,
-          downloadIndex: firstErrorIndex,
-        }))
-        downloadTS(tsUrlList, newFinishList)
-      } else {
-        setDownloadState((prev) => ({
-          ...prev,
-          downloadIndex: firstErrorIndex,
-        }))
-      }
-    },
-    [
-      finishList,
-      downloadState.isPaused,
-      downloadState.downloadIndex,
-      rangeDownload.endSegment,
-      tsUrlList,
-      downloadTS,
-    ],
-  )
-
-  // 下载整合后的TS文件
-  const downloadFile = useCallback(
-    (fileDataList: ArrayBuffer[], fileName: string) => {
-      const fileBlob = downloadState.isGetMP4
-        ? new Blob(fileDataList, { type: 'video/mp4' })
-        : new Blob(fileDataList, { type: 'video/MP2T' })
-
-      const extension = downloadState.isGetMP4 ? '.mp4' : '.ts'
-
-      const a = document.createElement('a')
-      a.download = fileName + extension
-      a.href = URL.createObjectURL(fileBlob)
-      a.style.display = 'none'
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-
-      // 释放 URL 对象
-      setTimeout(() => URL.revokeObjectURL(a.href), 100)
-    },
-    [downloadState.isGetMP4],
-  )
-
-  // 强制下载现有片段
-  const forceDownload = useCallback(() => {
-    if (mediaFileList.length) {
-      downloadFile(
-        mediaFileList,
-        title || format(beginTimeRef.current, 'yyyy_MM_dd_HH_mm_ss'),
-      )
-      toast.success('已触发浏览器下载现有片段')
-    } else {
-      toast.warning('当前无已下载片段')
-    }
-  }, [mediaFileList, downloadFile, title])
 
   return (
     <PageContainer scrollable={false}>
@@ -783,7 +726,6 @@ export default function M3u8Downloader() {
                 />
               </Field>
 
-              {/* 范围选择 */}
               {rangeDownload.isShowRange && (
                 <div className="flex flex-col sm:flex-row gap-3 min-w-[260px]">
                   <Field>
@@ -820,7 +762,6 @@ export default function M3u8Downloader() {
               )}
             </div>
 
-            {/* 主要操作按钮 */}
             <div className="flex flex-wrap gap-3">
               {!downloadState.isDownloading ? (
                 <>
@@ -845,7 +786,6 @@ export default function M3u8Downloader() {
                   onClick={togglePause}
                   size="lg"
                   variant={downloadState.isPaused ? 'default' : 'destructive'}
-                  className="min-w-[140px]"
                 >
                   {downloadState.isPaused ? (
                     <>
@@ -862,7 +802,6 @@ export default function M3u8Downloader() {
               )}
             </div>
 
-            {/* 流式下载区 */}
             {!downloadState.isDownloading && isSupperStreamWrite && (
               <div className="pt-4 border-t">
                 <p className="text-sm text-muted-foreground mb-3">
@@ -896,7 +835,6 @@ export default function M3u8Downloader() {
           </CardContent>
         </Card>
 
-        {/* 下载进度区 */}
         {finishList.length > 0 && (
           <Card>
             <CardHeader className="pb-4">
@@ -913,22 +851,22 @@ export default function M3u8Downloader() {
                     )}
                   </div>
 
-                  {mediaFileList.some(Boolean) && !streamWriter && (
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={forceDownload}
-                    >
-                      <Download className="mr-2 h-4 w-4" />
-                      下载已完成片段
-                    </Button>
-                  )}
+                  {mediaFileListRef.current.some(Boolean) &&
+                    !streamWriter.current && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={forceDownload}
+                      >
+                        <Download className="size-4" />
+                        下载已完成片段
+                      </Button>
+                    )}
                 </div>
               </div>
             </CardHeader>
 
             <CardContent className="space-y-6">
-              {/* 进度条 */}
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
                   <span>整体进度</span>
@@ -944,7 +882,6 @@ export default function M3u8Downloader() {
 
               <Separator />
 
-              {/* 错误提示 */}
               {errorNum > 0 && (
                 <Alert variant="destructive">
                   <AlertTitle>部分片段下载失败</AlertTitle>
@@ -954,7 +891,6 @@ export default function M3u8Downloader() {
                 </Alert>
               )}
 
-              {/* 片段网格 */}
               <TooltipProvider>
                 <div
                   className={cn(
@@ -963,7 +899,7 @@ export default function M3u8Downloader() {
                   )}
                 >
                   {finishList.map((item, index) => (
-                    // biome-ignore lint/suspicious/noArrayIndexKey: <explanation>
+                    // biome-ignore lint/suspicious/noArrayIndexKey: no unique identifier available
                     <Tooltip key={index}>
                       <TooltipTrigger asChild>
                         <button
@@ -989,7 +925,7 @@ export default function M3u8Downloader() {
                         </button>
                       </TooltipTrigger>
                       <TooltipContent>
-                        <p className="max-w-xs truncate">
+                        <p className="max-w-xs">
                           {item.title || `片段 ${index + 1}`}
                         </p>
                         <p className="text-xs text-muted-foreground mt-1">
