@@ -941,10 +941,9 @@ export default function M3u8Downloader() {
                 <div className="flex-1">
                   <TooltipProvider>
                     <div
-                      className={cn(
-                        'grid gap-1.5 auto-rows-fr',
-                        'grid-cols-6 sm:grid-cols-8 md:grid-cols-10 lg:grid-cols-12 xl:grid-cols-15',
-                      )}
+                      className={
+                        'grid grid-cols-[repeat(auto-fill,minmax(40px,1fr))] p-0.5 gap-2'
+                      }
                     >
                       {finishList.map((item, index) => (
                         // biome-ignore lint/suspicious/noArrayIndexKey: no unique identifier available
