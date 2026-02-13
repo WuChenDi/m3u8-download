@@ -10,16 +10,24 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
+  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from '@/components/ui/empty'
 import { Field } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
-import { Separator } from '@/components/ui/separator'
 import {
   Tooltip,
   TooltipContent,
@@ -715,170 +723,174 @@ export default function M3u8Downloader() {
 
   return (
     <PageContainer scrollable={false}>
-      <div className="container max-w-5xl mx-auto space-y-8 px-4 sm:px-6">
-        <div className="space-y-2 text-center">
-          <h1 className="text-3xl font-bold tracking-tight">
-            M3U8 在线下载工具
-          </h1>
-          <p className="text-muted-foreground">
-            支持范围下载、流式下载、AES 解密、转 MP4
-          </p>
-        </div>
-
-        <Card>
-          <CardHeader className="pb-4">
-            <CardTitle>输入 m3u8 链接</CardTitle>
-            <CardDescription>
-              粘贴完整的 m3u8 地址后选择下载方式
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-6">
-            <div className="flex flex-col sm:flex-row gap-4">
-              <Field>
-                <Label htmlFor="m3u8-url">m3u8 链接</Label>
-                <Input
-                  id="m3u8-url"
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  disabled={downloadState.isDownloading}
-                  placeholder="https://example.com/playlist.m3u8"
-                  className="text-base"
-                />
-              </Field>
-
-              {rangeDownload.isShowRange && (
-                <div className="flex flex-col sm:flex-row gap-3 min-w-[260px]">
-                  <Field>
-                    <Label>起始片段</Label>
-                    <Input
-                      type="number"
-                      min={1}
-                      value={rangeDownload.startSegment}
-                      onChange={(e) =>
-                        setRangeDownload((prev) => ({
-                          ...prev,
-                          startSegment: e.target.value,
-                        }))
-                      }
-                      disabled={downloadState.isDownloading}
-                    />
-                  </Field>
-                  <Field>
-                    <Label>结束片段</Label>
-                    <Input
-                      type="number"
-                      min={1}
-                      value={rangeDownload.endSegment}
-                      onChange={(e) =>
-                        setRangeDownload((prev) => ({
-                          ...prev,
-                          endSegment: e.target.value,
-                        }))
-                      }
-                      disabled={downloadState.isDownloading}
-                    />
-                  </Field>
-                </div>
-              )}
-            </div>
-
-            <div className="flex flex-wrap gap-3">
-              {!downloadState.isDownloading ? (
-                <>
-                  {!rangeDownload.isShowRange ? (
-                    <Button onClick={() => getM3U8(true)} variant="outline">
-                      选择范围下载
-                    </Button>
-                  ) : (
-                    <Button onClick={() => getM3U8(false)} variant="secondary">
-                      取消范围选择
-                    </Button>
-                  )}
-
-                  <Button onClick={() => getM3U8(false)}>
-                    原格式下载 (.ts)
-                  </Button>
-
-                  <Button onClick={getMP4}>转码 MP4 下载</Button>
-                </>
-              ) : (
-                <Button
-                  onClick={togglePause}
-                  size="lg"
-                  variant={downloadState.isPaused ? 'default' : 'destructive'}
-                >
-                  {downloadState.isPaused ? (
-                    <>
-                      <Play className="size-4" />
-                      继续下载
-                    </>
-                  ) : (
-                    <>
-                      <Pause className="size-4" />
-                      暂停下载
-                    </>
-                  )}
-                </Button>
-              )}
-            </div>
-
-            {!streamSaverLoaded && (
-              <div className="pt-4 border-t">
-                <p className="text-sm text-muted-foreground">
-                  正在加载流式下载功能...
-                </p>
-              </div>
-            )}
-
-            {!downloadState.isDownloading &&
-              streamSaverLoaded &&
-              isSupperStreamWrite && (
-                <div className="pt-4 border-t">
-                  <p className="text-sm text-muted-foreground mb-3">
-                    超大视频建议使用流式下载（几乎不占内存）
-                  </p>
-                  <div className="grid sm:grid-cols-2 gap-4">
-                    <Button
-                      onClick={() => streamDownload(false)}
-                      variant="outline"
-                      className={cn('h-12')}
-                    >
-                      流式原格式下载 (.ts)
-                    </Button>
-                    <Button
-                      onClick={() => streamDownload(true)}
-                      className={cn('h-12')}
-                    >
-                      流式 MP4 下载
-                    </Button>
-                  </div>
-                </div>
-              )}
-
-            {/* 🆕 Safari 降级提示 */}
-            {streamSaverLoaded && !isSupperStreamWrite && (
-              <div className="pt-4 border-t">
-                <Alert>
-                  <AlertDescription>
-                    当前浏览器不支持流式下载（Safari），将使用普通下载方式。
-                    建议使用 Chrome、Firefox 或 Edge 浏览器以获得更好体验。
-                  </AlertDescription>
-                </Alert>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {finishList.length > 0 && (
+      <div className="w-full h-full grid grid-cols-1 lg:grid-cols-[420px_1fr] gap-4">
+        {/* 左侧控制面板 */}
+        <div className="space-y-4">
           <Card>
             <CardHeader className="pb-4">
-              <div className="flex items-center justify-between flex-wrap gap-4">
-                <div>
-                  <CardTitle>下载进度</CardTitle>
-                  <CardDescription>总片段数：{targetSegment}</CardDescription>
+              <CardTitle>M3U8 在线下载工具</CardTitle>
+              <CardDescription>
+                支持范围下载、流式下载、AES 解密、转 MP4
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="space-y-4">
+                <Field>
+                  <Label htmlFor="m3u8-url">m3u8 链接</Label>
+                  <Input
+                    id="m3u8-url"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    disabled={downloadState.isDownloading}
+                    placeholder="https://example.com/playlist.m3u8"
+                    className="text-base"
+                  />
+                </Field>
+
+                {rangeDownload.isShowRange && (
+                  <div className="flex gap-3">
+                    <Field>
+                      <Label>起始片段</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={rangeDownload.startSegment}
+                        onChange={(e) =>
+                          setRangeDownload((prev) => ({
+                            ...prev,
+                            startSegment: e.target.value,
+                          }))
+                        }
+                        disabled={downloadState.isDownloading}
+                      />
+                    </Field>
+                    <Field>
+                      <Label>结束片段</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={rangeDownload.endSegment}
+                        onChange={(e) =>
+                          setRangeDownload((prev) => ({
+                            ...prev,
+                            endSegment: e.target.value,
+                          }))
+                        }
+                        disabled={downloadState.isDownloading}
+                      />
+                    </Field>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-2">
+                {!downloadState.isDownloading ? (
+                  <>
+                    {!rangeDownload.isShowRange ? (
+                      <Button
+                        onClick={() => getM3U8(true)}
+                        variant="outline"
+                        className="w-full"
+                      >
+                        选择范围下载
+                      </Button>
+                    ) : (
+                      <Button
+                        onClick={() => getM3U8(false)}
+                        variant="secondary"
+                        className="w-full"
+                      >
+                        取消范围选择
+                      </Button>
+                    )}
+
+                    <Button onClick={() => getM3U8(false)} className="w-full">
+                      原格式下载 (.ts)
+                    </Button>
+
+                    <Button onClick={getMP4} className="w-full">
+                      转码 MP4 下载
+                    </Button>
+                  </>
+                ) : (
+                  <Button
+                    onClick={togglePause}
+                    size="lg"
+                    variant={downloadState.isPaused ? 'default' : 'destructive'}
+                    className="w-full"
+                  >
+                    {downloadState.isPaused ? (
+                      <>
+                        <Play className="size-4" />
+                        继续下载
+                      </>
+                    ) : (
+                      <>
+                        <Pause className="size-4" />
+                        暂停下载
+                      </>
+                    )}
+                  </Button>
+                )}
+              </div>
+
+              {!streamSaverLoaded && (
+                <div className="pt-4 border-t">
+                  <p className="text-sm text-muted-foreground">
+                    正在加载流式下载功能...
+                  </p>
                 </div>
-                <div className="flex items-center gap-4 flex-wrap">
-                  <div className="text-sm space-x-3">
+              )}
+
+              {!downloadState.isDownloading &&
+                streamSaverLoaded &&
+                isSupperStreamWrite && (
+                  <div className="pt-4 border-t space-y-3">
+                    <p className="text-sm text-muted-foreground">
+                      超大视频建议使用流式下载（几乎不占内存）
+                    </p>
+                    <div className="flex flex-col gap-2">
+                      <Button
+                        onClick={() => streamDownload(false)}
+                        variant="outline"
+                        className="w-full h-11"
+                      >
+                        流式原格式下载 (.ts)
+                      </Button>
+                      <Button
+                        onClick={() => streamDownload(true)}
+                        className="w-full h-11"
+                      >
+                        流式 MP4 下载
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+              {streamSaverLoaded && !isSupperStreamWrite && (
+                <div className="pt-4 border-t">
+                  <Alert>
+                    <AlertDescription>
+                      当前浏览器不支持流式下载（Safari），将使用普通下载方式。
+                      建议使用 Chrome、Firefox 或 Edge 浏览器以获得更好体验。
+                    </AlertDescription>
+                  </Alert>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        <Card className="flex flex-col p-4 border-none h-full">
+          <CardHeader className="p-0">
+            <CardTitle>下载进度</CardTitle>
+            {finishList.length > 0 && (
+              <CardDescription>总片段数：{targetSegment}</CardDescription>
+            )}
+            <CardAction>
+              {finishList.length > 0 && (
+                <div className="flex items-center gap-3 flex-wrap">
+                  <div className="text-sm space-x-2">
                     <Badge variant="outline">已完成 {finishNum}</Badge>
                     {errorNum > 0 && (
                       <Badge variant="destructive">失败 {errorNum}</Badge>
@@ -897,88 +909,111 @@ export default function M3u8Downloader() {
                       </Button>
                     )}
                 </div>
-              </div>
-            </CardHeader>
-
-            <CardContent className="space-y-6">
-              <div className="space-y-2">
-                <div className="flex justify-between text-sm">
-                  <span>整体进度</span>
-                  <span className="font-medium">
-                    {((finishNum / targetSegment) * 100).toFixed(1)}%
-                  </span>
-                </div>
-                <Progress
-                  value={(finishNum / targetSegment) * 100}
-                  className="h-2.5"
-                />
-              </div>
-
-              <Separator />
-
-              {errorNum > 0 && (
-                <Alert variant="destructive">
-                  <AlertTitle>部分片段下载失败</AlertTitle>
-                  <AlertDescription>
-                    红色格子可点击重试 • 系统每 2 秒自动重试一次
-                  </AlertDescription>
-                </Alert>
               )}
+            </CardAction>
+          </CardHeader>
 
-              <TooltipProvider>
-                <div
-                  className={cn(
-                    'grid gap-1.5 auto-rows-fr',
-                    'grid-cols-6 sm:grid-cols-10 md:grid-cols-12 lg:grid-cols-15 xl:grid-cols-20',
-                  )}
-                >
-                  {finishList.map((item, index) => (
-                    // biome-ignore lint/suspicious/noArrayIndexKey: no unique identifier available
-                    <Tooltip key={index}>
-                      <TooltipTrigger asChild>
-                        <button
-                          onClick={() => retry(index)}
-                          disabled={item.status !== 'error'}
-                          className={cn(
-                            'aspect-square rounded-md border font-medium',
-                            'text-xs sm:text-sm',
-                            'transition-all duration-150 shadow-sm',
-                            'flex items-center justify-center',
-                            item.status === 'finish' &&
-                              'bg-emerald-600 hover:bg-emerald-700 border-emerald-700 text-white',
-                            item.status === 'error' &&
-                              'bg-red-600 hover:bg-red-700 border-red-700 text-white cursor-pointer hover:scale-105',
-                            item.status === 'downloading' &&
-                              'bg-blue-600 animate-pulse border-blue-700 text-white',
-                            item.status === '' &&
-                              'bg-muted hover:bg-muted/80 border-border text-muted-foreground',
-                            'disabled:cursor-not-allowed disabled:opacity-60',
-                          )}
-                        >
-                          {index + 1}
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p className="max-w-xs">
-                          {item.title || `片段 ${index + 1}`}
-                        </p>
-                        <p className="text-xs text-muted-foreground mt-1">
-                          {item.status === 'finish'
-                            ? '已完成'
-                            : item.status === 'error'
-                              ? '点击重试'
-                              : item.status === 'downloading'
-                                ? '下载中...'
-                                : '等待下载'}
-                        </p>
-                      </TooltipContent>
-                    </Tooltip>
-                  ))}
+          <CardContent className="flex flex-1 flex-col gap-4 p-0 overflow-hidden">
+            {finishList.length > 0 ? (
+              <>
+                <div className="space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span>整体进度</span>
+                    <span className="font-medium">
+                      {((finishNum / targetSegment) * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <Progress
+                    value={(finishNum / targetSegment) * 100}
+                    className="h-2.5"
+                  />
                 </div>
-              </TooltipProvider>
-            </CardContent>
-          </Card>
-        )}
+
+                {errorNum > 0 && (
+                  <Alert variant="destructive">
+                    <AlertTitle>部分片段下载失败</AlertTitle>
+                    <AlertDescription>
+                      红色格子可点击重试 • 系统每 2 秒自动重试一次
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                <div className="flex-1 overflow-y-auto">
+                  <TooltipProvider>
+                    <div
+                      className={cn(
+                        'grid gap-1.5 auto-rows-fr',
+                        'grid-cols-6 sm:grid-cols-8 md:grid-cols-10 lg:grid-cols-12 xl:grid-cols-15',
+                      )}
+                    >
+                      {finishList.map((item, index) => (
+                        // biome-ignore lint/suspicious/noArrayIndexKey: no unique identifier available
+                        <Tooltip key={index}>
+                          <TooltipTrigger asChild>
+                            <button
+                              onClick={() => retry(index)}
+                              disabled={item.status !== 'error'}
+                              className={cn(
+                                'aspect-square rounded-md border font-medium',
+                                'text-xs sm:text-sm',
+                                'transition-all duration-150 shadow-sm',
+                                'flex items-center justify-center',
+                                item.status === 'finish' &&
+                                  'bg-emerald-600 hover:bg-emerald-700 border-emerald-700 text-white',
+                                item.status === 'error' &&
+                                  'bg-red-600 hover:bg-red-700 border-red-700 text-white cursor-pointer hover:scale-105',
+                                item.status === 'downloading' &&
+                                  'bg-blue-600 animate-pulse border-blue-700 text-white',
+                                item.status === '' &&
+                                  'bg-muted hover:bg-muted/80 border-border text-muted-foreground',
+                                'disabled:cursor-not-allowed disabled:opacity-60',
+                              )}
+                            >
+                              {index + 1}
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p className="max-w-xs wrap-break-word">
+                              {item.title || `片段 ${index + 1}`}
+                            </p>
+                            <p className="text-xs text-muted-foreground mt-1">
+                              {item.status === 'finish'
+                                ? '已完成'
+                                : item.status === 'error'
+                                  ? '点击重试'
+                                  : item.status === 'downloading'
+                                    ? '下载中...'
+                                    : '等待下载'}
+                            </p>
+                          </TooltipContent>
+                        </Tooltip>
+                      ))}
+                    </div>
+                  </TooltipProvider>
+                </div>
+              </>
+            ) : (
+              <Empty className="flex-1">
+                <EmptyMedia variant="icon">
+                  <Download className="size-5" />
+                </EmptyMedia>
+
+                <EmptyHeader>
+                  <EmptyTitle>暂无下载任务</EmptyTitle>
+                  <EmptyDescription>
+                    输入 M3U8 链接开始下载视频片段
+                  </EmptyDescription>
+                </EmptyHeader>
+
+                <EmptyContent>
+                  <p className="text-xs text-muted-foreground/80">
+                    支持范围下载、流式下载、AES 解密和 MP4 转码
+                  </p>
+                </EmptyContent>
+              </Empty>
+            )}
+          </CardContent>
+        </Card>
       </div>
     </PageContainer>
   )

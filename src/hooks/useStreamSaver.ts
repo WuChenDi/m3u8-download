@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { logger } from '@/lib'
 import { getStreamSaver, setupStreamSaver } from '@/lib/streamSaver'
 
 export function useStreamSaver(middleTransporterUrl = '/mitm.html') {
@@ -11,7 +12,6 @@ export function useStreamSaver(middleTransporterUrl = '/mitm.html') {
     if (typeof window === 'undefined') return
 
     try {
-      // 检查是否已经加载
       const existing = getStreamSaver()
       if (existing) {
         setIsSupported(!existing.useBlobFallback)
@@ -19,17 +19,16 @@ export function useStreamSaver(middleTransporterUrl = '/mitm.html') {
         return
       }
 
-      // 设置 StreamSaver
       const config = setupStreamSaver(middleTransporterUrl)
       setIsSupported(!config.useBlobFallback)
       setIsLoaded(true)
 
-      console.log('StreamSaver 初始化完成:', {
+      logger.log('StreamSaver Initialization completed:', {
         useBlobFallback: config.useBlobFallback,
         isSupported: !config.useBlobFallback,
       })
     } catch (error) {
-      console.error('Failed to setup StreamSaver:', error)
+      logger.error('Failed to setup StreamSaver:', error)
       setIsLoaded(true)
       setIsSupported(false)
     }
