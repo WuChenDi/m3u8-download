@@ -26,6 +26,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { useStreamSaver } from '@/hooks/useStreamSaver'
 import { AESDecryptor, cn, logger } from '@/lib'
 
 // ============================================================
@@ -115,7 +116,15 @@ const triggerBrowserDownload = (
 // ============================================================
 
 export default function M3u8Downloader() {
-  const [url, setUrl] = useState('')
+  const {
+    isLoaded: streamSaverLoaded,
+    isSupported: streamSaverSupported,
+    streamSaver,
+  } = useStreamSaver()
+
+  const [url, setUrl] = useState(
+    'https://vv.jisuzyv.com/play/hls/e5yy3ZRe/index.m3u8',
+  )
   const [title, setTitle] = useState('')
 
   const [downloadState, setDownloadState] = useState<DownloadState>({
@@ -128,7 +137,10 @@ export default function M3u8Downloader() {
 
   const [finishList, setFinishList] = useState<FinishItem[]>([])
   const [tsUrlList, setTsUrlList] = useState<string[]>([])
-  const streamWriter = useRef<any>(null)
+
+  const streamWriter = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(
+    null,
+  )
 
   const [rangeDownload, setRangeDownload] = useState<RangeDownload>({
     isShowRange: false,
@@ -153,7 +165,6 @@ export default function M3u8Downloader() {
   const downloadStateRef = useRef(downloadState)
   downloadStateRef.current = downloadState
 
-  // aesConf ref：解密在 async worker 中调用，需要读取最新值
   const aesConfRef = useRef(aesConf)
   aesConfRef.current = aesConf
 
@@ -178,13 +189,9 @@ export default function M3u8Downloader() {
     return finalEnd - finalStart + 1
   }, [rangeDownload.startSegment, rangeDownload.endSegment, tsUrlList.length])
 
-  const isSupperStreamWrite = useMemo(
-    () =>
-      typeof window !== 'undefined' &&
-      (window as any).streamSaver &&
-      !(window as any).streamSaver.useBlobFallback,
-    [],
-  )
+  const isSupperStreamWrite = useMemo(() => {
+    return streamSaverLoaded && streamSaverSupported
+  }, [streamSaverLoaded, streamSaverSupported])
 
   // ---- AES 解密 ----
   const aesDecrypt = (data: ArrayBuffer, index: number): ArrayBuffer => {
@@ -512,14 +519,20 @@ export default function M3u8Downloader() {
         toast.error('资源为空，请查看链接是否有效')
         setDownloadState((prev) => ({ ...prev, isDownloading: false }))
       }
-    } catch {
-      toast.error('链接不正确，请查看链接是否有效')
+    } catch (error) {
+      toast.error((error as any).message || '链接不正确，请查看链接是否有效')
+      logger.error('解析 m3u8 失败:', (error as any).message)
       setDownloadState((prev) => ({ ...prev, isDownloading: false }))
     }
   }
 
   // ---- 流式下载 ----
   const streamDownload = (isMp4: boolean) => {
+    if (!streamSaver) {
+      toast.error('流式下载功能未就绪，请刷新页面重试')
+      return
+    }
+
     setDownloadState((prev) => ({ ...prev, isGetMP4: isMp4 }))
     downloadStateRef.current = {
       ...downloadStateRef.current,
@@ -534,12 +547,18 @@ export default function M3u8Downloader() {
     const finalFileName =
       document.title !== 'm3u8 downloader' ? document.title : fileName
 
-    const writer = (window as any).streamSaver
-      .createWriteStream(`${finalFileName}.${isMp4 ? 'mp4' : 'ts'}`)
-      .getWriter()
-    streamWriter.current = writer
-    toast.info('开始流式下载（边下边存）')
-    void getM3U8(false)
+    try {
+      const writer = streamSaver
+        .createWriteStream(`${finalFileName}.${isMp4 ? 'mp4' : 'ts'}`)
+        .getWriter()
+
+      streamWriter.current = writer
+      toast.info('开始流式下载（边下边存）')
+      void getM3U8(false)
+    } catch (error) {
+      toast.error('创建流式下载失败')
+      console.error(error)
+    }
   }
 
   // ---- 转码 MP4 下载 ----
@@ -687,6 +706,10 @@ export default function M3u8Downloader() {
   useEffect(() => {
     return () => {
       aesConfRef.current.decryptor?.destroy()
+      if (streamWriter.current) {
+        streamWriter.current.abort?.().catch(() => {})
+        streamWriter.current = null
+      }
     }
   }, [])
 
@@ -700,9 +723,6 @@ export default function M3u8Downloader() {
           <p className="text-muted-foreground">
             支持范围下载、流式下载、AES 解密、转 MP4
           </p>
-          <div className="text-sm text-muted-foreground italic mt-2">
-            测试链接：https://upyun.luckly-mjw.cn/Assets/media-source/example/media/index.m3u8
-          </div>
         </div>
 
         <Card>
@@ -802,34 +822,48 @@ export default function M3u8Downloader() {
               )}
             </div>
 
-            {!downloadState.isDownloading && isSupperStreamWrite && (
+            {!streamSaverLoaded && (
               <div className="pt-4 border-t">
-                <p className="text-sm text-muted-foreground mb-3">
-                  超大视频建议使用流式下载（几乎不占内存）
+                <p className="text-sm text-muted-foreground">
+                  正在加载流式下载功能...
                 </p>
-                <div className="grid sm:grid-cols-2 gap-4">
-                  <Button
-                    onClick={() => streamDownload(false)}
-                    variant="outline"
-                    className={cn(
-                      'h-12',
-                      'border-green-600 text-green-700',
-                      'hover:bg-green-50 hover:text-green-800',
-                    )}
-                  >
-                    流式原格式下载 (.ts)
-                  </Button>
-                  <Button
-                    onClick={() => streamDownload(true)}
-                    className={cn(
-                      'h-12',
-                      'bg-gradient-to-r from-green-600 to-emerald-600',
-                      'hover:from-green-700 hover:to-emerald-700',
-                    )}
-                  >
-                    流式 MP4 下载
-                  </Button>
+              </div>
+            )}
+
+            {!downloadState.isDownloading &&
+              streamSaverLoaded &&
+              isSupperStreamWrite && (
+                <div className="pt-4 border-t">
+                  <p className="text-sm text-muted-foreground mb-3">
+                    超大视频建议使用流式下载（几乎不占内存）
+                  </p>
+                  <div className="grid sm:grid-cols-2 gap-4">
+                    <Button
+                      onClick={() => streamDownload(false)}
+                      variant="outline"
+                      className={cn('h-12')}
+                    >
+                      流式原格式下载 (.ts)
+                    </Button>
+                    <Button
+                      onClick={() => streamDownload(true)}
+                      className={cn('h-12')}
+                    >
+                      流式 MP4 下载
+                    </Button>
+                  </div>
                 </div>
+              )}
+
+            {/* 🆕 Safari 降级提示 */}
+            {streamSaverLoaded && !isSupperStreamWrite && (
+              <div className="pt-4 border-t">
+                <Alert>
+                  <AlertDescription>
+                    当前浏览器不支持流式下载（Safari），将使用普通下载方式。
+                    建议使用 Chrome、Firefox 或 Edge 浏览器以获得更好体验。
+                  </AlertDescription>
+                </Alert>
               </div>
             )}
           </CardContent>
