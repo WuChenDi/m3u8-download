@@ -99,7 +99,8 @@
       "!**/.turbo",
       "!**/.cache",
       "!src/components/reactbits/**/*.tsx",
-      "!src/components/ui/**/*.tsx"
+      "!src/components/ui/**/*.tsx",
+      "!src/lib/aes-decryptor.ts"
     ]
   }
 }
