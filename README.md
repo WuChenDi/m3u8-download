@@ -1,3 +1,6 @@
+> [!WARNING]
+> This repository has been moved to: [m3u8-download](https://github.com/WuChenDi/projects/tree/main/apps/m3u8-download)
+
 # 🎬 M3U8 在线下载工具
 
 强大的 M3U8/HLS 视频下载工具，支持范围下载、流式下载、AES 解密
